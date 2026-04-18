@@ -219,9 +219,6 @@ Proyek ini dibuat untuk keperluan **Capstone Project** dalam program AI Engineer
 
 ---
 
-## 👨‍💻 Author
-
-**[Nama Kamu]**
 AI Engineer — Capstone Project
 
 > *"Turning leftover ingredients into delightful meals — one AI recommendation at a time."* 🍳
