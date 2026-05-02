@@ -1,0 +1,5 @@
+{
+  "tokenizer_class": "BertTokenizer",
+  "do_lower_case": true,
+  "model_max_length": 64
+}
