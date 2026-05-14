@@ -1,27 +1,30 @@
 """
 AE2 — Inference Module
 Proyek OLAH · CC26-PSU127 · Coding Camp 2026
-Handles loading BERT model dari AE1 handoff dan menjalankan prediksi klasifikasi bahan.
+Framework: TensorFlow (sesuai kesepakatan dengan AE1)
+Format model yang didukung:
+  - artifacts/saved_model/   → TF SavedModel format (direkomendasikan)
+  - artifacts/model.h5       → Keras HDF5 format (alternatif)
 """
 
 import json
 import logging
 import os
 from typing import Any
-
-import numpy as np
-import torch
 from transformers import BertTokenizer
+import tensorflow as tf
+import numpy as np
 
 logger = logging.getLogger(__name__)
 
 
 class IngredientPredictor:
-    """
-    Modul utama inference untuk klasifikasi bahan makanan.
-    Menerima model handoff dari AE1 (model.pt + tokenizer + label_map.json).
-    Mengklasifikasikan bahan ke kategori: utama, substitusi, opsional.
-    """
+    MODEL_CANDIDATES = [
+        ("saved_model", "dir"),
+        ("model.h5", "file"),
+        ("model", "dir"),
+    ]
+    PLACEHOLDER_MARKER = b"MOCK_MODEL_PLACEHOLDER"
 
     def __init__(self, artifacts_dir: str = "artifacts"):
         self.artifacts_dir = artifacts_dir
@@ -29,78 +32,118 @@ class IngredientPredictor:
         self.tokenizer = None
         self.label_map = None
         self.id_to_label = None
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self._is_loaded = False
+        self._model_format = None
 
     def load(self) -> None:
-        """Load semua artefak dari AE1 handoff."""
         try:
-            # Load label map
-            label_map_path = os.path.join(self.artifacts_dir, "label_map.json")
-            with open(label_map_path, "r", encoding="utf-8") as f:
-                self.label_map = json.load(f)
-            self.id_to_label = {v: k for k, v in self.label_map.items()}
-            logger.info(f"Label map loaded: {list(self.label_map.keys())}")
+            self._load_label_map()
+            self._load_tokenizer()
 
-            # Load tokenizer dari AE1
-            tokenizer_path = os.path.join(self.artifacts_dir, "tokenizer")
-            self.tokenizer = BertTokenizer.from_pretrained(tokenizer_path)
-            logger.info("Tokenizer loaded.")
+            model_path, model_format = self._detect_model()
+            if model_path is None:
+                logger.warning("Tidak ada model AE1 ditemukan. Running in MOCK mode.")
+                self._is_loaded = False
+                return
 
-            # Load model — cek placeholder dulu sebelum torch.load
-            model_path = os.path.join(self.artifacts_dir, "model.pt")
-            with open(model_path, "rb") as f:
-                header = f.read(32)
-            if b"MOCK_MODEL_PLACEHOLDER" in header:
+            if self._is_placeholder(model_path, model_format):
                 logger.warning(
-                    "model.pt adalah placeholder mock — menunggu handoff AE1. "
+                    f"{model_path} adalah placeholder mock — menunggu handoff AE1. "
                     "Running in MOCK mode."
                 )
                 self._is_loaded = False
                 return
 
-            self.model = torch.load(model_path, map_location=self.device)
-            self.model.eval()
-            logger.info(f"Model loaded on device: {self.device}")
-
+            self._load_model(model_path, model_format)
             self._is_loaded = True
+            logger.info(f"Model loaded ({model_format}): {model_path}")
 
         except FileNotFoundError as e:
-            logger.warning(f"Artifact not found: {e}. Running in mock mode.")
+            logger.warning(f"Artifact tidak ditemukan: {e}. Running in MOCK mode.")
             self._is_loaded = False
+        except Exception as e:
+            logger.error(f"Gagal load model: {e}. Running in MOCK mode.")
+            self._is_loaded = False
+
+    def _load_label_map(self) -> None:
+        path = os.path.join(self.artifacts_dir, "label_map.json")
+        with open(path, "r", encoding="utf-8") as f:
+            self.label_map = json.load(f)
+        self.id_to_label = {v: k for k, v in self.label_map.items()}
+        logger.info(f"Label map loaded: {list(self.label_map.keys())}")
+
+    def _load_tokenizer(self) -> None:
+        tokenizer_path = os.path.join(self.artifacts_dir, "tokenizer")
+        self.tokenizer = BertTokenizer.from_pretrained(tokenizer_path)
+        logger.info("Tokenizer loaded.")
+
+    def _detect_model(self) -> tuple[str | None, str | None]:
+        for name, kind in self.MODEL_CANDIDATES:
+            full_path = os.path.join(self.artifacts_dir, name)
+            if kind == "dir" and os.path.isdir(full_path):
+                return full_path, "saved_model"
+            elif kind == "file" and os.path.isfile(full_path):
+                return full_path, "h5"
+        return None, None
+
+    def _is_placeholder(self, path: str, fmt: str) -> bool:
+        try:
+            if fmt == "h5":
+                with open(path, "rb") as f:
+                    return self.PLACEHOLDER_MARKER in f.read(64)
+            elif fmt == "saved_model":
+                pb_path = os.path.join(path, "saved_model.pb")
+                if not os.path.isfile(pb_path):
+                    return True
+                with open(pb_path, "rb") as f:
+                    return self.PLACEHOLDER_MARKER in f.read(64)
+        except Exception:
+            pass
+        return False
+
+    def _load_model(self, path: str, fmt: str) -> None:
+        if fmt == "saved_model":
+            self.model = tf.saved_model.load(path)
+            self._model_format = "saved_model"
+        elif fmt == "h5":
+            self.model = tf.keras.models.load_model(path)
+            self._model_format = "h5"
+        logger.info(f"Model TensorFlow loaded (format: {fmt})")
 
     def is_ready(self) -> bool:
         return self._is_loaded
 
     def preprocess(self, ingredient: str) -> dict[str, Any]:
-        """Tokenisasi input bahan untuk BERT."""
         encoding = self.tokenizer(
             ingredient,
             max_length=64,
             padding="max_length",
             truncation=True,
-            return_tensors="pt",
+            return_tensors="tf",
         )
-        return {k: v.to(self.device) for k, v in encoding.items()}
+        return dict(encoding)
 
     def predict_single(self, ingredient: str) -> dict[str, Any]:
-        """
-        Prediksi kategori satu bahan.
-        Returns dict: { ingredient, label, confidence, all_scores }
-        """
         if not self._is_loaded:
             return self._mock_predict(ingredient)
 
         inputs = self.preprocess(ingredient)
-        with torch.no_grad():
+
+        if self._model_format == "saved_model":
             outputs = self.model(**inputs)
-            logits = outputs.logits
-            probs = torch.softmax(logits, dim=-1).squeeze().cpu().numpy()
-            pred_id = int(np.argmax(probs))
+        else:
+            outputs = self.model(inputs, training=False)
+
+        logits = outputs.logits if hasattr(outputs, "logits") else outputs
+        probs = tf.nn.softmax(logits, axis=-1).numpy().squeeze()
+        pred_id = int(np.argmax(probs))
 
         label = self.id_to_label.get(pred_id, "unknown")
         confidence = float(probs[pred_id])
-        all_scores = {self.id_to_label[i]: float(probs[i]) for i in range(len(probs))}
+        all_scores = {
+            self.id_to_label[i]: round(float(probs[i]), 4)
+            for i in range(len(probs))
+        }
 
         return {
             "ingredient": ingredient,
@@ -110,40 +153,20 @@ class IngredientPredictor:
         }
 
     def predict_batch(self, ingredients: list[str]) -> list[dict[str, Any]]:
-        """Prediksi batch bahan dari satu resep."""
         return [self.predict_single(ing) for ing in ingredients]
 
-    def classify_recipe_ingredients(
-        self, ingredients: list[str]
-    ) -> dict[str, Any]:
-        """
-        Klasifikasi seluruh bahan resep dan kelompokkan per kategori.
-        Output format yang disepakati dengan AE1 & Backend.
-        """
+    def classify_recipe_ingredients(self, ingredients: list[str]) -> dict[str, Any]:
         predictions = self.predict_batch(ingredients)
 
-        result: dict[str, list] = {
-            "utama": [],
-            "substitusi": [],
-            "opsional": [],
-        }
+        result: dict[str, list] = {"utama": [], "substitusi": [], "opsional": []}
 
         for pred in predictions:
             label = pred["label"]
-            if label in result:
-                result[label].append(
-                    {
-                        "name": pred["ingredient"],
-                        "confidence": pred["confidence"],
-                    }
-                )
-            else:
-                result["opsional"].append(
-                    {
-                        "name": pred["ingredient"],
-                        "confidence": pred["confidence"],
-                    }
-                )
+            bucket = label if label in result else "opsional"
+            result[bucket].append({
+                "name": pred["ingredient"],
+                "confidence": pred["confidence"],
+            })
 
         return {
             "classified": result,
@@ -152,20 +175,16 @@ class IngredientPredictor:
         }
 
     def _mock_predict(self, ingredient: str) -> dict[str, Any]:
-        """
-        Mock response saat model belum tersedia (Sprint 3).
-        AE2 dapat develop API paralel tanpa menunggu AE1.
-        """
         import random
 
         labels = ["utama", "substitusi", "opsional"]
-        # Heuristic sederhana untuk mock yang lebih realistis
-        if any(
-            k in ingredient.lower()
-            for k in ["bawang", "garam", "gula", "minyak", "air"]
-        ):
+        utama_keywords = ["bawang", "garam", "gula", "minyak", "air", "nasi", "ayam", "daging", "telur", "tahu", "tempe"]
+        opsional_keywords = ["daun", "merica", "kaldu", "penyedap", "serai","lengkuas", "kunyit", "ketumbar"]
+
+        ing_lower = ingredient.lower()
+        if any(k in ing_lower for k in utama_keywords):
             label = "utama"
-        elif any(k in ingredient.lower() for k in ["daun", "merica", "kaldu"]):
+        elif any(k in ing_lower for k in opsional_keywords):
             label = "opsional"
         else:
             label = random.choice(labels)
